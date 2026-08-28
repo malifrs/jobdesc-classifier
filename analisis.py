@@ -1,161 +1,207 @@
-"""Lapisan analisis aplikasi web.
+"""Analysis layer for the JobDesc Classifier web app.
 
-Modul ini memuat komponen terlatih dari berkas bundel joblib, lalu menjalankan
-prosedur analisis yang sama persis dengan tahap eksperimen pada notebook:
-klasifikasi peran (SVM), penetapan sub-role (cosine similarity), dan ekstraksi
-keterampilan (pencocokan kamus O*NET).
+This module loads the trained model bundle from a joblib file, then runs the
+same analysis pipeline used during the notebook experiments: role classification
+(SVM), sub-role assignment (cosine similarity), and skill extraction (O*NET
+dictionary matching).
 """
 
 from pathlib import Path
-import re
+from typing import Optional, TypedDict
 
 import joblib
 import numpy as np
+import re
 from sklearn.metrics.pairwise import cosine_similarity
 
-# Panjang minimum masukan. Teks yang lebih pendek dari ini tidak memuat cukup
-# informasi untuk dianalisis, jadi ditolak sebelum masuk ke model.
-MIN_KARAKTER = 30
+# Minimum input length; text shorter than this lacks enough signal to analyze.
+MIN_CHARS = 30
 
 
-def normalize(text):
+class SubRoleResult(TypedDict):
+    """Result of matching a job description to an O*NET occupation profile."""
+    sub_role: Optional[str]
+    onet_code: Optional[str]
+    cosine_similarity: float
+    ranking: list["SubRoleCandidate"]
+
+
+class SubRoleCandidate(TypedDict):
+    """A single ranked candidate occupation from cosine-similarity matching."""
+    sub_role: str
+    onet_code: str
+    cosine_similarity: float
+
+
+class SkillMatch(TypedDict):
+    """A skill recognized in the text along with its occupation weight."""
+    skill: str
+    weight: int
+
+
+class RoleMargin(TypedDict):
+    """A ranked role candidate from the SVM decision-function scores."""
+    role: str
+    margin: float
+
+
+class AnalysisResult(TypedDict):
+    """Full output of analyzing one job description."""
+    main_role: str
+    sub_role: Optional[str]
+    onet_code: Optional[str]
+    cosine_similarity: float
+    skills: list[SkillMatch]
+    top_3_sub_role: list[SubRoleCandidate]
+    top_3_role_margins: list[RoleMargin]
+
+
+# Bundle components are a dict of trained artifacts loaded from the joblib file.
+BundleComponents = dict[str, object]
+
+
+def normalize(text: str) -> str:
+    """Lowercase the text and collapse all whitespace runs into single spaces."""
     return re.sub(r"\s+", " ", str(text).lower()).strip()
 
 
-def contains_term(text, term):
-    """Cek kemunculan istilah sebagai kata utuh (menghindari kecocokan sebagian).
-    Token pendek diblokir HANYA bila alfanumerik murni (mis. "go", "ai", "os")
-    yang rawan bertabrakan dengan kata umum; nama simbolik seperti "c#" atau
-    "c++" tetap diizinkan karena cukup khas."""
-    term = normalize(term)
-    if not term:
+def contains_term(text: str, term: str) -> bool:
+    """Check whether `term` appears as a whole word in `text` (no partial matches).
+
+    Short terms are blocked ONLY when they are purely alphanumeric (e.g. "go",
+    "ai", "os") because they easily collide with common words; symbolic names
+    like "c#" or "c++" are still allowed because they are distinctive enough.
+    """
+    normalized_term = normalize(term)
+    if not normalized_term:
         return False
-    if len(term) < 3 and term.isalnum():
+    if len(normalized_term) < 3 and normalized_term.isalnum():
         return False
-    return re.search(r"(?<![a-z0-9])" + re.escape(term) + r"(?![a-z0-9])", text) is not None
+    pattern = r"(?<![a-z0-9])" + re.escape(normalized_term) + r"(?![a-z0-9])"
+    return re.search(pattern, text) is not None
 
 
-class Penganalisis:
-    """Pembungkus komponen terlatih beserta prosedur analisisnya."""
+class Classifier:
+    """Wraps the trained model bundle and exposes the analysis pipeline."""
 
-    def __init__(self, komponen):
-        self.model = komponen["role_model"]
-        self.profiles = komponen["profiles"]
-        self.subrole_vectorizer = komponen["subrole_vectorizer"]
-        self.profile_matrix = komponen["profile_matrix"]
-        self.skill_weight_by_code = komponen["skill_weight_by_code"]
-        self.all_skill_names = komponen["all_skill_names"]
-        self.skill_aliases = komponen["skill_aliases"]
-        self.acronym_to_skill = komponen["acronym_to_skill"]
-        self.metadata = komponen.get("metadata", {})
+    def __init__(self, components: BundleComponents) -> None:
+        self.model = components["role_model"]
+        self.profiles = components["profiles"]
+        self.subrole_vectorizer = components["subrole_vectorizer"]
+        self.profile_matrix = components["profile_matrix"]
+        self.skill_weight_by_code = components["skill_weight_by_code"]
+        self.all_skill_names = components["all_skill_names"]
+        self.skill_aliases = components["skill_aliases"]
+        self.acronym_to_skill = components["acronym_to_skill"]
+        self.metadata = components.get("metadata", {})
 
-    def tentukan_subrole(self, teks, peran):
-        """Pilih sub-role dengan cosine similarity tertinggi, dibatasi pada
-        okupasi yang berada di dalam peran hasil prediksi."""
-        mask = (self.profiles["role_category"] == peran).values
+    def find_subrole(self, text: str, role: str) -> SubRoleResult:
+        """Pick the best-matching sub-role via cosine similarity, restricted to
+        occupations that belong to the predicted role category."""
+        mask = (self.profiles["role_category"] == role).values
         if not mask.any():
             return {"sub_role": None, "onet_code": None, "cosine_similarity": 0.0, "ranking": []}
 
-        kemiripan = cosine_similarity(
-            self.subrole_vectorizer.transform([teks]), self.profile_matrix[mask]
+        similarities = cosine_similarity(
+            self.subrole_vectorizer.transform([text]), self.profile_matrix[mask]
         ).ravel()
 
-        kandidat = self.profiles[mask].reset_index(drop=True)
-        urutan = np.argsort(-kemiripan)
-        ranking = [
+        candidates = self.profiles[mask].reset_index(drop=True)
+        order = np.argsort(-similarities)
+        ranking: list[SubRoleCandidate] = [
             {
-                "sub_role": kandidat.iloc[i]["sub_role"],
-                "onet_code": kandidat.iloc[i]["onet_code"],
-                "cosine_similarity": round(float(kemiripan[i]), 4),
+                "sub_role": candidates.iloc[i]["sub_role"],
+                "onet_code": candidates.iloc[i]["onet_code"],
+                "cosine_similarity": round(float(similarities[i]), 4),
             }
-            for i in urutan
+            for i in order
         ]
-        terbaik = ranking[0]
+        best = ranking[0]
         return {
-            "sub_role": terbaik["sub_role"],
-            "onet_code": terbaik["onet_code"],
-            "cosine_similarity": terbaik["cosine_similarity"],
+            "sub_role": best["sub_role"],
+            "onet_code": best["onet_code"],
+            "cosine_similarity": best["cosine_similarity"],
             "ranking": ranking,
         }
 
-    def ekstraksi_keterampilan(self, teks, onet_code=None):
-        """Ambil keterampilan dari teks dengan mencocokkan kamus O*NET beserta
-        aliasnya. Bobot diambil dari okupasi sub-role terpilih; keterampilan di
-        luar daftar okupasi tersebut tetap ditampilkan dengan bobot dasar 1."""
-        teks = normalize(teks)
-        bobot_okupasi = self.skill_weight_by_code.get(onet_code, {})
+    def extract_skills(self, text: str, onet_code: Optional[str] = None) -> list[SkillMatch]:
+        """Extract skills from the text by matching the O*NET dictionary and its
+        aliases. Weights come from the selected sub-role's occupation; skills
+        outside that occupation are still shown with a default weight of 1."""
+        normalized_text = normalize(text)
+        occupation_weights = self.skill_weight_by_code.get(onet_code, {})
 
-        def bobot(skill):
-            return int(bobot_okupasi.get(skill, 1))
+        def weight(skill: str) -> int:
+            return int(occupation_weights.get(skill, 1))
 
-        ditemukan = {}
+        found: dict[str, int] = {}
         for skill in self.all_skill_names:
-            alias = [skill] + self.skill_aliases.get(skill, [])
-            if any(contains_term(teks, a) for a in alias):
-                ditemukan[skill] = bobot(skill)
+            aliases = [skill] + self.skill_aliases.get(skill, [])
+            if any(contains_term(normalized_text, alias) for alias in aliases):
+                found[skill] = weight(skill)
 
-        for akronim, skill in self.acronym_to_skill.items():
-            if contains_term(teks, akronim):
-                ditemukan.setdefault(skill, bobot(skill))
+        for acronym, skill in self.acronym_to_skill.items():
+            if contains_term(normalized_text, acronym):
+                found.setdefault(skill, weight(skill))
 
-        hasil = [{"skill": s, "bobot": w} for s, w in ditemukan.items()]
-        hasil.sort(key=lambda item: (-item["bobot"], item["skill"].lower()))
-        return hasil
+        results: list[SkillMatch] = [{"skill": s, "weight": w} for s, w in found.items()]
+        results.sort(key=lambda item: (-item["weight"], item["skill"].lower()))
+        return results
 
-    def analisis(self, deskripsi):
-        """Analisis satu deskripsi pekerjaan secara utuh."""
-        teks = str(deskripsi).strip()
-        if len(teks) < MIN_KARAKTER:
-            raise ValueError(f"Deskripsi pekerjaan minimal {MIN_KARAKTER} karakter.")
+    def analyze(self, description: str) -> AnalysisResult:
+        """Run the full analysis pipeline on a single job description."""
+        text = str(description).strip()
+        if len(text) < MIN_CHARS:
+            raise ValueError(f"Job description must be at least {MIN_CHARS} characters.")
 
-        peran = str(self.model.predict([teks])[0])
+        role = str(self.model.predict([text])[0])
 
-        # Margin keputusan dipakai untuk mengurutkan kandidat peran. Nilainya
-        # bukan probabilitas, jadi tidak ditampilkan ke pengguna.
-        margin = np.asarray(self.model.decision_function([teks])).ravel()
-        peringkat_peran = sorted(
+        # Decision-function margins are used to rank role candidates. These are
+        # not probabilities, so they are never shown to the user.
+        margins = np.asarray(self.model.decision_function([text])).ravel()
+        role_ranking: list[RoleMargin] = sorted(
             (
-                {"role": str(label), "margin": round(float(skor), 4)}
-                for label, skor in zip(self.model.classes_, margin)
+                {"role": str(label), "margin": round(float(score), 4)}
+                for label, score in zip(self.model.classes_, margins)
             ),
             key=lambda item: item["margin"],
             reverse=True,
         )
 
-        subrole = self.tentukan_subrole(teks, peran)
-        keterampilan = self.ekstraksi_keterampilan(teks, subrole["onet_code"])
+        subrole = self.find_subrole(text, role)
+        skills = self.extract_skills(text, subrole["onet_code"])
 
         return {
-            "role_utama": peran,
+            "main_role": role,
             "sub_role": subrole["sub_role"],
             "onet_code": subrole["onet_code"],
             "cosine_similarity": subrole["cosine_similarity"],
-            "keterampilan": keterampilan,
+            "skills": skills,
             "top_3_sub_role": subrole["ranking"][:3],
-            "top_3_margin_peran": peringkat_peran[:3],
+            "top_3_role_margins": role_ranking[:3],
         }
 
 
-def cari_bundel(path_bundel=None):
-    """Cari berkas bundel di lokasi yang lazim relatif terhadap berkas ini."""
-    if path_bundel:
-        return Path(path_bundel)
+def find_bundle(bundle_path: Optional[str] = None) -> Path:
+    """Locate the joblib model bundle in common locations relative to this file."""
+    if bundle_path:
+        return Path(bundle_path)
 
-    dasar = Path(__file__).resolve().parent
-    kandidat = [
-        dasar / "job_role_onet_complete.joblib",
-        dasar.parent / "svm_onet_bright_outlook_output" / "job_role_onet_complete.joblib",
-        dasar / "svm_onet_bright_outlook_output" / "job_role_onet_complete.joblib",
+    base = Path(__file__).resolve().parent
+    candidates = [
+        base / "job_role_onet_complete.joblib",
+        base.parent / "svm_onet_bright_outlook_output" / "job_role_onet_complete.joblib",
+        base / "svm_onet_bright_outlook_output" / "job_role_onet_complete.joblib",
     ]
-    for berkas in kandidat:
-        if berkas.exists():
-            return berkas
+    for file in candidates:
+        if file.exists():
+            return file
     raise FileNotFoundError(
-        "Berkas job_role_onet_complete.joblib tidak ditemukan. "
-        "Jalankan notebook terlebih dahulu atau salin berkas tersebut ke folder aplikasi."
+        "File job_role_onet_complete.joblib was not found. Run the notebook first "
+        "or copy that file into the app folder."
     )
 
 
-def muat_penganalisis(path_bundel=None):
-    """Muat bundel dari disk dan bungkus menjadi objek Penganalisis."""
-    return Penganalisis(joblib.load(cari_bundel(path_bundel)))
+def load_classifier(bundle_path: Optional[str] = None) -> Classifier:
+    """Load the model bundle from disk and wrap it into a Classifier instance."""
+    return Classifier(joblib.load(find_bundle(bundle_path)))
